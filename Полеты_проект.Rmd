@@ -1,0 +1,1215 @@
+---
+title: "Шок и восстановление: влияние пандемии на операционную надёжность внутренних авиаперевозок США (2019–2023)"
+subtitle: "Оценка глубины спада, скорости и полноты возврата к норме и структурного сдвига в причинах задержек"
+author: "Лозовская"
+date: "`r format(Sys.Date(), '%d.%m.%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    df_print: paged
+    code_folding: show
+    theme: flatly
+    highlight: tango
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      warning = FALSE,
+                      message = FALSE,
+                      fig.width  = 9,
+                      fig.height = 5,
+                      fig.align  = "center")
+
+
+options(dplyr.summarise.inform = FALSE,
+        scipen = 999)
+```
+
+Документ воспроизводитя сверху вниз (что логично). Единственный внешний файл - **flights_sample_3m.csv** (при запуске должен лежать в рабочей директории). На первом запуске из него один раз собирается **flights.parquet**; при повторных запусках шаг конвертации пропускается. Внешние датасеты не нужны - все контрольные ряды и "дозы" воздействия строятся из сегментов внутри самого источника.
+
+# Подготовка среды
+
+## Библиотеки и глобальный сид
+
+Установка всех библиотек, проверка корректности установки, сидирование.
+
+```{r libs}
+required <- c("tidyverse",
+              "lubridate",
+              "scales",
+              "knitr",
+              "duckdb",
+              "DBI",
+              "forecast",
+              "tseries",
+              "zoo",
+              "plm",
+              "lmtest",
+              "sandwich",
+              "CausalImpact",
+              "FactoMineR",
+              "factoextra",
+              "cluster",
+              "xgboost",
+              "shapviz")
+
+
+missing <- required[!vapply(required,
+                            requireNamespace,
+                            logical(1),
+                            quietly = TRUE)]
+if (length(missing) > 0) {stop("Не установлены пакеты: ",
+                               paste(missing,
+                                     collapse = ", "),
+                               "\nУстановите их: install.packages(c(",
+                               paste(sprintf('"%s"',
+                                             missing),
+                                     collapse = ", "),
+                               "))")}
+
+
+invisible(lapply(required,
+                 function(p) suppressMessages(library(p,
+                                                      character.only = TRUE))))
+
+
+stopifnot("dplyr не подключён - перезапустите R и выполните чанки по порядку" = "package:dplyr" %in% search())
+
+
+SEED <- 25062026
+set.seed(SEED)
+
+
+N_LARGE <- 1800000
+N_SMALL <- 900000
+```
+
+## Конвертация из CSV в Parquet и единый view
+
+Конвертация производится потоково средствами **DuckDB**: движок читает **CSV** и пишет колоночный **Parquet**, не загружая все 3000000 строк в память. Сжатие **ZSTD** заметно уменьшает файл и ускоряет последующие чтения. Тип каждой колонки выводится по полному сканированию (**sample_size = -1**), чтобы дата и числовые поля распознавались корректно.
+
+```{r convert-parquet}
+csv_path <- "flights_sample_3m.csv"
+parquet_path <- "flights.parquet"
+
+
+con <- dbConnect(duckdb::duckdb())
+
+
+if (!file.exists(parquet_path)) {dbExecute(con,
+sprintf("COPY (SELECT * FROM read_csv_auto('%s', header = true, sample_size = -1))
+        TO '%s' (FORMAT PARQUET, COMPRESSION ZSTD);",
+        csv_path,
+        parquet_path))}
+```
+
+Поверх паркета строится view **flights**, в котором все имена колонок приведены к нижнему регистру. Дальше и **SQL**, и **R** обращаются к данным единообразно - код не зависит от того, в каком регистре заголовки пришли из **CSV**.
+
+```{r lowercase-view}
+raw_cols <- dbGetQuery(con,
+                       sprintf("DESCRIBE SELECT * FROM read_parquet('%s')",
+                               parquet_path))$column_name
+
+
+select_expr <- paste(sprintf('"%s" AS %s',
+                             raw_cols,
+                             tolower(raw_cols)),
+                     collapse = ", ")
+
+dbExecute(con, sprintf("CREATE OR REPLACE VIEW flights AS SELECT %s FROM read_parquet('%s')",
+                       select_expr,
+                       parquet_path))
+
+
+schema <- dbGetQuery(con,
+                     "DESCRIBE SELECT * FROM flights")
+n_total <- dbGetQuery(con,
+                      "SELECT count(*) AS n FROM flights")$n
+
+
+cat("Всего строк в паркете:",
+    format(n_total,
+           big.mark = " "),
+    "\n")
+kable(schema,
+      caption = "Схема данных (имена приведены к нижнему регистру)")
+```
+
+## Контрольные подвыборки (сид 25062026)
+
+Подвыборки нужны не для основной аналитики (ряды и панель считаются на полных данных ради плотности), а для проверки устойчивости ставочных метрик: если доля отмен и средняя задержка почти совпадают на подвыборке в 900000 наблюдений, на подвыборке в 1800000 наблюдений и на полном источнике, значит случайная десятипроцентная выборка надёжна, и тяжёлые порейсовые шаги можно при необходимости делать на подвыборке без смещения.
+
+Большая подвыборка (1800000 наблюдений) тянется воспроизводимым reservoir-сэмплингом **DuckDB**; малая подвыборка (900000 наблюдений) берётся как случайное вложенное подмножество большой - так проверяется стабильность оценок при удвоении объёма.
+
+```{r subsamples}
+slim_cols <- "fl_date, origin, dest, origin_city, dest_city, airline_code,
+  dep_delay, arr_delay, cancelled, diverted, cancellation_code, distance,
+  delay_due_carrier, delay_due_weather, delay_due_nas,
+  delay_due_security, delay_due_late_aircraft"
+
+
+flights_large <- dbGetQuery(con, sprintf("SELECT %s FROM flights USING SAMPLE %d ROWS (reservoir, %d)",
+                                         slim_cols,
+                                         N_LARGE, SEED))
+flights_large <- as_tibble(flights_large)
+flights_large$fl_date <- as.Date(flights_large$fl_date)
+
+
+set.seed(SEED)
+flights_small <- slice_sample(flights_large,
+                              n = N_SMALL)
+
+
+cat("Большая подвыборка:",
+    nrow(flights_large),
+    "строк | ",
+    "Малая подвыборка:",
+    nrow(flights_small),
+    "строк\n")
+```
+
+## Служебные функции
+
+Единые определения метрик надёжности и структуры причин задержек, чтобы считать их одинаково на любом срезе (полные данные, год, подвыборка).
+
+```{r helpers}
+reliability_summary <- function(df) {df %>%
+    
+    summarise(n_flights = n(),
+              cancel_rate = mean(cancelled == 1,
+                                 na.rm = TRUE),
+              divert_rate = mean(diverted == 1,
+                                 na.rm = TRUE),
+              mean_arr_delay = mean(arr_delay,
+                                    na.rm = TRUE),
+              median_arr_delay = median(arr_delay,
+                                        na.rm = TRUE),
+              share_delayed15 = sum(arr_delay >= 15,
+                                    na.rm = TRUE) / n())}
+
+
+# структура причин задержек: доля минут по каждой причине (поля delay_due_* заполнены только для рейсов с задержкой от 15 минут)
+cause_cols <- c("delay_due_carrier",
+                "delay_due_weather",
+                "delay_due_nas",
+                "delay_due_security",
+                "delay_due_late_aircraft")
+
+
+cause_structure <- function(df) {df %>%
+    
+    filter(!is.na(delay_due_carrier)) %>%
+    
+    summarise(across(all_of(cause_cols),
+                     ~ sum(.x,
+                           na.rm = TRUE))) %>%
+    
+    pivot_longer(everything(),
+                 names_to = "cause",
+                 values_to = "minutes") %>%
+    
+    mutate(
+      cause = str_remove(cause,
+                         "delay_due_"),
+      share = minutes / sum(minutes)) %>%
+    
+    arrange(desc(share))}
+```
+
+# Задача 1. Эталон доковидной нормы (2019)
+
+## Логика пропусков
+
+Прежде чем считать метрики, фиксируется устройство источника: пропуски здесь не "грязь", а смысл. Причины задержек заполнены только когда задержка прилёта превысила 15 минут; у отменённых рейсов нет фактических времён вылета и прилёта. Нужно показать это явно, чтобы дальше корректно интерпретировать **NA**.
+
+```{r missingness}
+missing_logic <- dbGetQuery(con,
+  "SELECT
+    -- доля рейсов без причины задержки среди НЕ задержавшихся (>= 15) и среди задержавшихся
+    avg(CASE WHEN arr_delay <  15 AND delay_due_carrier IS NULL THEN 1.0 ELSE 0 END) AS na_cause_when_ontime,
+    avg(CASE WHEN arr_delay >= 15 AND delay_due_carrier IS NULL THEN 1.0 ELSE 0 END) AS na_cause_when_delayed,
+    -- доля отменённых рейсов без фактического времени прилёта
+    avg(CASE WHEN cancelled = 1 AND arr_time IS NULL THEN 1.0 ELSE 0 END) AS na_arrtime_when_cancelled,
+    avg(CASE WHEN cancelled = 0 AND arr_time IS NULL THEN 1.0 ELSE 0 END) AS na_arrtime_when_flown
+  FROM flights")
+
+missing_logic %>%
+  
+  pivot_longer(everything(),
+               names_to = "проверка",
+               values_to = "доля") %>%
+  
+  mutate(доля = percent(доля,
+                        accuracy = 0.1)) %>%
+  
+  kable(caption = "Пропуски следуют логике источника, а не являются ошибками")
+```
+
+Видно ожидаемое: причина задержки практически всегда **NA** у непросроченных рейсов и почти всегда заполнена у задержавшихся; фактическое время прилёта отсутствует именно у отменённых. Числа подтверждают это однозначно: пустая причина встречается у 79,3 % выборки - и это ровно непросроченные рейсы (**arr_delay < 15**), тогда как среди задержавшихся на 15 и более минут причина не заполнена в 0% случаев; фактическое время прилёта отсутствует у 2,6 % выборки - и это в точности отменённые рейсы (у выполненных - 0%). Пропуск здесь - не дефект данных, а маркер состояния рейса. Дальше это учитывается: отмены считаются отдельным флагом, причины - только по задержанным рейсам.
+
+## Эталонный профиль 2019 года
+
+```{r baseline-2019}
+baseline_2019 <- dbGetQuery(con,
+  "SELECT
+    count(*) AS n_flights,
+    avg(CASE WHEN cancelled = 1 THEN 1.0 ELSE 0 END) AS cancel_rate,
+    avg(CASE WHEN diverted  = 1 THEN 1.0 ELSE 0 END) AS divert_rate,
+    avg(arr_delay) AS mean_arr_delay,
+    median(arr_delay) AS median_arr_delay,
+    avg(CASE WHEN arr_delay >= 15 THEN 1.0 ELSE 0 END) AS share_delayed15
+  FROM flights
+  WHERE year(fl_date) = 2019") %>%
+  
+  as_tibble()
+
+baseline_2019 %>%
+  
+  mutate(across(c(cancel_rate,
+                  divert_rate,
+                  share_delayed15),
+                ~ percent(.x,
+                          accuracy = 0.01)),
+         across(c(mean_arr_delay,
+                  median_arr_delay),
+                ~ round(.x,
+                        2))) %>%
+  
+  kable(caption = "Эталон надёжности 2019 года (полные данные)")
+```
+
+Доковидная норма читается так: на 757673 рейсах 2019 года ставка отмен составляла 1,79 %, диверсий - 0,26 %, средняя задержка прилёта - 5,31 минута, а медианная - −6 мин, то есть в типичном рейсе борт прибывал на шесть минут раньше расписания, и положительное среднее тянет вверх "хвост" немногих сильно опоздавших рейсов. Доля рейсов с задержкой 15 минут и более - 18,64%. Это и есть эталонный уровень надёжности, относительно которого дальше измеряются и провал 2020-го, и недовосстановление 2023-го.
+
+```{r baseline-cause}
+cause_2019 <- dbGetQuery(con,
+                         sprintf(
+  "SELECT %s
+  FROM flights
+  WHERE year(fl_date) = 2019 AND arr_delay >= 15",
+  paste(sprintf("sum(%s) AS %s",
+                cause_cols,
+                cause_cols),
+        collapse = ", "))) %>%
+  
+  pivot_longer(everything(),
+               names_to = "cause",
+               values_to = "minutes") %>%
+  
+  mutate(cause = str_remove(cause,
+                            "delay_due_"),
+         share = minutes / sum(minutes)) %>%
+  
+  arrange(desc(share))
+
+
+ggplot(cause_2019,
+       aes(x = reorder(cause,
+                       share),
+           y = share,
+           fill = cause)) +
+  
+  geom_col(show.legend = FALSE) +
+  
+  geom_text(aes(label = percent(share,
+                                accuracy = 0.1)),
+            hjust = -0.1,
+            size = 3.5) +
+  
+  coord_flip() +
+  
+  scale_y_continuous(labels = percent_format(),
+                     expand = expansion(mult = c(0,
+                                                 .15))) +
+  
+  labs(title = "Структура причин задержек, 2019",
+       subtitle = "Доля минут задержки по каждой причине - эталон для сравнения",
+       x = NULL,
+       y = "Доля минут задержки") +
+  
+  theme_minimal()
+```
+
+Структура минут задержки в 2019-м распределена так: **late_aircraft** - 39,7%, **carrier** - 30,3%, **nas** (загруженность воздушного пространства) - 24,3%, **weather** - 5,6%, **security** - 0,1%. Иными словами, уже до пандемии две «эксплуатационные» причины - поздний приход предыдущего борта и вина перевозчика - давали 70% всех минут задержки, а, собственно, погода объясняла лишь около 1/18. Это важная точка отсчёта: рост именно эксплуатационной доли и будет трактоваться как структурный сдвиг (задача 2).
+
+## Проверка устойчивости метрик на подвыборках
+
+Сравнение эталонных ставок, посчитанных на полных данных 2019 года, с теми же ставками на малой и большой подвыборках (срез 2019). Близость значений подтверждает: случайная подвыборка несмещённо оценивает ставочные метрики.
+
+```{r baseline-robustness}
+rob <- bind_rows(flights_small %>%
+                   
+                   filter(year(fl_date) == 2019) %>%
+                   
+                   reliability_summary() %>%
+                   
+                   mutate(srez = "малая (900000)"),
+                 flights_large %>%
+                   
+                   filter(year(fl_date) == 2019) %>%
+                   
+                   reliability_summary() %>%
+                   
+                   mutate(srez = "большая (1800000)"),
+                 baseline_2019 %>%
+                   
+                   transmute(n_flights,
+                             cancel_rate,
+                             divert_rate,
+                             mean_arr_delay,
+                             median_arr_delay,
+                             share_delayed15,
+                             srez = "полные данные")) %>%
+  
+  select(srez,
+         everything())
+
+
+rob %>%
+  
+  mutate(across(c(cancel_rate,
+                  divert_rate,
+                  share_delayed15),
+                ~ percent(.x,
+                          accuracy = 0.01)),
+         
+         across(c(mean_arr_delay,
+                  median_arr_delay),
+                ~ round(.x,
+                        2))) %>%
+  
+  kable(caption = "Ставочные метрики надёжности на срезе 2019 года (~25% объёма каждой подвыборки): малая vs большая vs полные данные")
+```
+
+Вывод по задаче 1. Зафиксирован эталон 2019 года: ставка отмен 1,79%, средняя/медианная задержка прилёта 5,31 минут / −6 минут, доля задержек более, чем на 15 минут - 18,64%, и структура причин с доминированием эксплуатационных (**late_aircraft** + **carrier** = 70%). Проверка на подвыборках это подтверждает и проходит тест на удвоение объёма: на малой подвыборке (срез 2019 - 227737 рейсов) метрики составляют 1,82% отмен, 5,29 минут средней задержки и 18,63% задержек более, чем на 15 минут; на большой (455339 рейсов) - 1,81%, 5,28 мин и 18,67%. Все три метрики (доля отмен, средняя задержка, доля задержек более, чем на 15 минут - при едином с эталоном знаменателе) на подвыборках совпадают с полными данными (18,64%) в пределах сотых долей процента и десятых минуты, причём оценки практически не двигаются при удвоении выборки с 900000 до 1800000 строк. Метрики устойчивы к объёму выборки, поэтому весь дальнейший анализ опирается на доли и средние, а не на абсолютные счётчики.
+
+# Задача 2. Восстановление и структурный сдвиг
+
+## Помесячная динамика надёжности
+
+Строятся помесячные ряды ключевых ставок на полных данных и наносится линию начала пандемии (март 2020). Сразу разводятся два измерения (объём и надёжность) потому что восстанавливаются они по-разному.
+
+```{r monthly-series}
+monthly <- dbGetQuery(con,
+  "SELECT
+    date_trunc('month', fl_date) AS ym,
+    count(*) AS n_flights,
+    avg(CASE WHEN cancelled = 1 THEN 1.0 ELSE 0 END) AS cancel_rate,
+    avg(arr_delay) AS mean_arr_delay,
+    avg(CASE WHEN arr_delay >= 15 THEN 1.0 ELSE 0 END) AS share_delayed15
+  FROM flights
+  GROUP BY 1 ORDER BY 1") %>%
+  
+  as_tibble() %>%
+  
+  mutate(ym = as.Date(ym))
+
+
+covid_line <- as.Date("2020-03-01")
+
+
+monthly %>%
+  
+  select(ym,
+         `Объём (рейсы)` = n_flights,
+         `Ставка отмен` = cancel_rate,
+         `Средняя задержка` = mean_arr_delay,
+         `Доля задержек на 15 минут и более` = share_delayed15) %>%
+  
+  pivot_longer(-ym,
+               names_to = "metric",
+               values_to = "value") %>%
+  
+  ggplot(aes(ym,
+             value)) +
+  
+  geom_vline(xintercept = covid_line,
+             linetype = "dashed",
+             colour = "#a0a0a4") +
+  
+  geom_line(colour = "#265073") +
+  
+  facet_wrap(~ metric,
+             scales = "free_y") +
+  
+  labs(title = "Помесячная динамика: объём и надёжность восстанавливаются по-разному",
+       subtitle = "Пунктир - начало пандемии (март 2020)",
+       x = NULL,
+       y = NULL) +
+  
+  theme_minimal()
+```
+
+Четыре панели сразу показывают главную асимметрию восстановления. Объём обваливается с примерно 60000 рейсов в месяц до примерно 19000-20000 в апреле 2020 и к 2023 году возвращается практически к доковидному уровню (примерно 55000-61000). Ставка отмен даёт резкий одиночный пик до примерно 42% весной 2020, после чего быстро садится обратно к фоновым 2-3% (с локальными всплесками до 5-6% зимой 2021 и 2022). А вот средняя задержка и доля задержек на 15 минут и более ведут себя иначе: в 2020 они проваливаются (средняя задержка уходит даже в минус, до примерно −13 минут - пустое небо, борта приходят раньше), но к 2022-2023 не просто возвращаются, а превышают уровень 2019-го (пики средней задержки ~10-16 минут, доли задержек на 15 минут и более - до 25%). То есть объём и отмены восстановились, а пунктуальность - нет; именно это расхождение и есть предмет дальнейшего анализа.
+
+Чтобы отделить собственно восстановительный тренд от сезонной волны, берётся суточный ряд по крупнейшему хабу и раскладываем его методом STL. Пропуски по дням (особенно в провале 2020) интерполируются, чтобы получился регулярный ряд.
+
+```{r top-hubs}
+top_hubs <- dbGetQuery(con,
+  "SELECT origin, count(*) AS n FROM flights
+  WHERE year(fl_date) = 2019
+  GROUP BY origin ORDER BY n DESC LIMIT 6")$origin
+
+
+top_hubs
+```
+
+```{r stl}
+hub <- top_hubs[1]
+
+
+daily_hub <- dbGetQuery(con,
+                        sprintf(
+  "SELECT fl_date,
+         avg(arr_delay) AS mean_delay,
+         avg(CASE WHEN cancelled = 1 THEN 1.0 ELSE 0 END) AS cancel_rate
+  FROM flights WHERE origin = '%s'
+  GROUP BY fl_date ORDER BY fl_date",
+  hub)) %>%
+  
+  as_tibble() %>%
+  
+  mutate(fl_date = as.Date(fl_date)) %>%
+
+  complete(fl_date = seq(min(fl_date),
+                         max(fl_date),
+                         by = "day")) %>%
+  
+  mutate(mean_delay = na.approx(mean_delay,
+                                na.rm = FALSE)) %>%
+  
+  fill(mean_delay,
+       .direction = "downup")
+
+
+ts_hub <- ts(daily_hub$mean_delay,
+             frequency = 7)
+stl_hub <- stl(ts_hub,
+               s.window = "periodic",
+               robust = TRUE)
+
+
+autoplot(stl_hub) +
+  labs(title = paste0("STL-декомпозиция суточной задержки прилёта, хаб ",
+                      hub),
+       subtitle = "Тренд отделён от недельной сезонности и остатка") +
+  
+  theme_minimal()
+```
+
+Декомпозиция по крупнейшему хабу (**ATL**) подтверждает, что наблюдаемая динамика - это именно тренд, а не сезонная иллюзия. Недельная сезонность мала по амплитуде (порядка +-1 мин вокруг нуля) и стабильна на всём горизонте, тогда как тренд гуляет в диапазоне примерно от −10 минут (дно 2020 года) до +18-20 минут на пике 2022-2023 годов - то есть, собственно, восстановительная составляющая на порядок крупнее недельной волны. Остаток несёт редкие резкие выбросы вверх (до 100-150 минут - разовые погодные/операционные сбои), которые не маскируют тренд. Вывод: рост задержек к 2023 году - это устойчивый сдвиг уровня, а не артефакт календаря.
+
+На помесячном ряде средней задержки прогоняется стандартный набор тестов, чтобы корректно выбрать форму последующих моделей.
+
+```{r stationarity}
+x <- monthly$mean_arr_delay
+
+stat_tbl <- tibble(Тест = c("ADF",
+                            "KPSS",
+                            "PP"),
+                   Статистика = c(adf.test(x)$statistic,
+                                  kpss.test(x)$statistic,
+                                  pp.test(x)$statistic),
+                   `p-value` = c(adf.test(x)$p.value,
+                                 kpss.test(x)$p.value,
+                                 pp.test(x)$p.value),
+                   `H0` = c("есть единичный корень (нестационарность)",
+                            "ряд стационарен",
+                            "есть единичный корень (нестационарность)"))
+
+
+kable(stat_tbl,
+      digits = 3,
+      caption = "Тесты стационарности помесячного ряда средней задержки")
+```
+
+Три теста согласованно указывают на нестационарность ряда. **ADF** даёт статистику -1,907 при p = 0,612 - нулевую гипотезу о единичном корне отвергнуть нельзя. **PP** даёт -14,135 при p = 0,266 - тот же вывод. **KPSS**, у которого нулевая гипотеза обратная (ряд стационарен), даёт 0,538 при p = 0,033, то есть стационарность отвергается. Все три теста смотрят в одну сторону: ряд средней задержки имеет тренд/единичный корень. Практическое следствие - дальше нельзя работать с уровнями "в лоб"; в панельной части нужно переходить к фиксированным эффектам и сравнению разностей динамики, а не самих уровней.
+
+Главный содержательный вывод части: к 2022-2023 объём вернулся, но структура причин "сломалась" - выросла доля задержек по вине перевозчика и из-за позднего прихода бортов (след кадрового кризиса и плотных расписаний).
+
+```{r cause-shift}
+cause_by_year <- dbGetQuery(con,
+                            sprintf(
+  "SELECT year(fl_date) AS year, %s
+  FROM flights WHERE arr_delay >= 15
+  GROUP BY 1 ORDER BY 1",
+  paste(sprintf("sum(%s) AS %s",
+                cause_cols,
+                cause_cols),
+        collapse = ", "))) %>%
+  
+  as_tibble() %>%
+  
+  pivot_longer(-year,
+               names_to = "cause",
+               values_to = "minutes") %>%
+  
+  mutate(cause = str_remove(cause,
+                            "delay_due_")) %>%
+  
+  group_by(year) %>%
+  
+  mutate(share = minutes / sum(minutes)) %>%
+  
+  ungroup()
+
+
+ggplot(cause_by_year,
+       aes(factor(year),
+           share,
+           fill = cause)) +
+  
+  geom_col(position = "fill") +
+  
+  scale_y_continuous(labels = percent_format()) +
+  
+  scale_fill_brewer(palette = "Set2") +
+  
+  labs(title = "Структура причин задержек по годам",
+       subtitle = "Доля carrier и late_aircraft растёт к 2022–2023 при вернувшемся объёме",
+       x = NULL,
+       y = "Доля минут задержки",
+       fill = "Причина") +
+  
+  theme_minimal()
+
+
+cause_by_year %>%
+  
+  filter(cause %in% c("carrier",
+                      "late_aircraft"),
+         year %in% c(2019,
+                     2023)) %>%
+  
+  group_by(year) %>% 
+  
+  summarise(operational_share = sum(share)) %>%
+  
+  kable(digits = 3,
+        caption = "Доля эксплуатационных причин (carrier + late aircraft): 2019 против 2023")
+```
+
+Числа подтверждают гипотезу о структурном сдвиге. Доля "эксплуатационных" причин (**carrier** + **late_aircraft**) выросла с 0,7 в 2019 до 0,76 в 2023. Растёт сдвиг за счёт сжатия доли **nas** (загруженность воздушного пространства): на столбчатой диаграмме её сегмент уменьшается с примерно 24% в 2019 до примерно 19% в 2023, тогда как доля **weather** держится около 5% постоянно. Содержательно это и есть "след кадрового кризиса и плотных расписаний": при вернувшемся объёме надёжность проседает не из-за погоды или перегруженного неба, а по причинам, которые внутри контура самого перевозчика.
+
+Вывод по задаче 2. Объём перевозок к 2023 возвращается к доковидному уровню, тогда как надёжность - нет: средняя задержка и доля задержек на 15 минут и более к 2022-2023 годам превышают эталон 2019-го. **STL** подтверждает, что это устойчивый тренд (амплитуда примерно +-1 минута у сезонности против раскачиваний от -10 до +20 минут у тренда), а не сезонность; тесты **ADF**/**KPSS**/**PP** согласованно фиксируют нестационарность ряда. Одновременно меняется природа задержек: вес погодных и "небесных" (nas) причин снижается, а эксплуатационных (перевозчик, поздний борт) растёт с 0,7 до 0,76. Это и есть структурный сдвиг "объём вернулся, а структура сломалась", который далее оценивается причинно.
+
+# Задача 3. Причинная оценка эффекта
+
+## Панель "аэропорт * месяц" и доза воздействия
+
+Чистого контроля, не затронутого пандемией, в данных нет - шок глобален. Идентификацию даёт разная сила удара по разным аэропортам. Доза задаётся пред-ковидной характеристикой (размер хаба по объёму 2019 года) - это трейт, определённый ДО вмешательства, поэтому он не является следствием шока.
+
+```{r panel-build}
+panel <- dbGetQuery(con,
+  "SELECT origin,
+         date_trunc('month', fl_date) AS ym,
+         count(*) AS n_flights,
+         avg(arr_delay) AS mean_arr_delay,
+         avg(CASE WHEN cancelled = 1 THEN 1.0 ELSE 0 END) AS cancel_rate
+  FROM flights GROUP BY 1, 2") %>%
+  
+  as_tibble() %>%
+  
+  mutate(ym = as.Date(ym))
+
+
+hub_size_2019 <- panel %>%
+  
+  filter(year(ym) == 2019) %>%
+  
+  group_by(origin) %>%
+  
+  summarise(vol_2019 = sum(n_flights),
+            .groups = "drop") %>%
+  
+  mutate(tier = cut(vol_2019,
+                    quantile(vol_2019,
+                             c(0,
+                               1/3,
+                               2/3,
+                               1)),
+                    labels = c("small",
+                               "mid",
+                               "high"),
+                    include.lowest = TRUE))
+
+
+panel <- panel %>%
+  
+  inner_join(hub_size_2019,
+             by = "origin") %>%
+  
+  filter(!is.na(tier)) %>%
+  
+  mutate(post = as.integer(ym >= as.Date("2020-03-01")),
+         high_dose = as.integer(tier == "high"))
+
+
+keep_origin <- panel %>%
+  
+  count(origin) %>%
+  
+  filter(n >= 48) %>%
+  
+  pull(origin)
+
+
+panel <- panel %>%
+  
+  filter(origin %in% keep_origin)
+
+cat("Аэропортов в панели:",
+    n_distinct(panel$origin),
+    "| месяцев:",
+    n_distinct(panel$ym),
+    "\n")
+```
+
+В сбалансированную панель попадает 316 аэропортов на горизонте в 56 месяцев (2019-2023). Доза воздействия - индикатор **high_dose** (верхний тертиль аэропортов по объёму 2019 года), заданный до марта 2020-го, из-за чего он не может быть следствием шока.
+
+## Разность разностей (двусторонние фиксированные эффекты)
+
+Оценивается, насколько сильнее изменилась надёжность крупных хабов после марта 2020 относительно мелких, при контроле общих по времени шоков (**FE** месяца) и постоянных различий аэропортов (**FE** аэропорта). Идентифицирующий коэффициент - взаимодействие **high_dose** * **post**.
+
+```{r did}
+pdat <- pdata.frame(panel,
+                    index = c("origin",
+                              "ym"))
+
+
+did_delay <- plm(mean_arr_delay ~
+                   high_dose:post,
+                 data = pdat,
+                 model = "within",
+                 effect = "twoways")
+
+
+coeftest(did_delay,
+         vcov = vcovHC(did_delay,
+                       type = "HC1",
+                       cluster = "group"))
+```
+
+Суммарный по всему пост-периоду коэффициент взаимодействия **high_dose** * **post** равен -0,718 минут (кластерная по аэропорту с.о. 0,722; t = -0,99; p = 0,320) - знак отрицательный, но статистически он неотличим от нуля. Это ожидаемо и не противоречит наличию эффекта: усреднение по всему пост-периоду смешивает резкий провал 2020-го с почти сомкнувшимся разрывом 2022-2023 годов, и средний коэффициент "размывается". Поэтому рассматривается динамика по годам: взаимодействие дозы с годами показывает, как расходились траектории высоко- и низкодозовых аэропортов год к году.
+
+```{r event-study}
+pdat$yr <- factor(year(as.Date(as.character(pdat$ym))))
+
+es <- plm(mean_arr_delay ~
+            high_dose:yr,
+          data = pdat,
+          model = "within",
+          effect = "twoways")
+
+es_tidy <- tibble(term = names(coef(es)),
+                  estimate = coef(es)) %>%
+  
+  mutate(year = as.integer(str_extract(term,
+                                       "\\d{4}"))) %>%
+  
+  filter(!is.na(year))
+
+
+ggplot(es_tidy,
+       aes(year,
+           estimate)) +
+  
+  geom_hline(yintercept = 0,
+             linetype = "dashed",
+             colour = "#a0a0a4") +
+  
+  geom_line(colour = "#ff746c") +
+  
+  geom_point(colour = "#ff746c") +
+  
+  labs(title = "Событийная динамика: разрыв высоко- и низкодозовых аэропортов",
+       subtitle = "Коэффициенты high_dose * год (двусторонние FE)",
+       x = NULL,
+       y = "Дополнительная средняя задержка, минут") +
+  
+  theme_minimal()
+```
+
+Событийная кривая делает картину наглядной (2023 - базовый год, поэтому его коэффициент = 0). В 2019 разрыв близок к нулю (примерно -0,4 минуты) - пред-тренда практически нет, что поддерживает допущение о параллельных трендах. В 2020 коэффициент проваливается до примерно -5,5 минут: крупные хабы в момент шока опустели и стали приходить заметно раньше, чем мелкие аэропорты - их "дополнительная задержка" резко отрицательна. Затем разрыв монотонно стягивается обратно: примерно -2,3 минуты в 2021, примерно 1 минута в 2022 и сходит к нулю к 2023. То есть эффект "дозы" - это в первую очередь разная глубина провала 2020 года, который к 2023 в основном рассосался.
+
+В дополнение к панели строится контрфактуал байесовским структурным рядом. В роли отклика - помесячная задержка сильно затронутого сегмента (крупные хабы), в роли ковариаты-контроля - тот же показатель для менее затронутого сегмента (мелкие аэропорты). Оговорка по идентификации: контроль тоже испытал пандемию, поэтому оценка интерпретируется как дополнительное отклонение сильного сегмента сверх общей динамики - это робастная проверка к панельной оценке, а не независимое доказательство.
+
+```{r causalimpact}
+ci_wide <- panel %>%
+  
+  mutate(seg = if_else(high_dose == 1,
+                       "response",
+                       "control")) %>%
+  
+  group_by(ym,
+           seg) %>%
+  
+  summarise(val = mean(mean_arr_delay,
+                       na.rm = TRUE),
+            .groups = "drop") %>%
+  
+  pivot_wider(names_from = seg,
+              values_from = val) %>%
+  
+  arrange(ym) %>%
+  
+  drop_na(response,
+          control)
+
+
+z <- zoo(cbind(response = ci_wide$response,
+               control = ci_wide$control),
+         order.by = ci_wide$ym)
+
+
+pre_period  <- c(min(ci_wide$ym),
+                 as.Date("2020-02-01"))
+post_period <- c(as.Date("2020-03-01"),
+                 max(ci_wide$ym))
+
+
+impact <- CausalImpact(z,
+                       pre_period,
+                       post_period)
+
+
+plot(impact)
+```
+
+```{r causalimpact-summary}
+summary(impact)
+```
+
+Байесовский контрфактуал согласуется по знаку с панелью. В пост-периоде фактическая средняя задержка сильно затронутого сегмента (крупные хабы) составила 2,2 минуты против прогнозных 3,6 минут, построенных по динамике мелких аэропортов - то есть абсолютный эффект составляет -1,4 минуты в среднем (95% ДИ [-2,7; +0,05]) и -56,8 минут накопленно (95% ДИ [-111,9; +2,1]). В относительном выражении это −35% (95% ДИ [-55%; +2,3%]), апостериорная вероятность эффекта 97%, p ~= 0,03. Знак уверенно отрицательный - крупные хабы отклонились вниз от того, что предсказывала динамика контроля (на графике это глубокий провал чёрной линии под пунктирным прогнозом в 2020, после чего к 2022-2023 годам линии сходятся) - но величина оценена широко: верхняя граница 95% ДИ едва касается нуля. То есть направление эффекта поддержано надёжно, а его точный размер - с большой неопределённостью, что естественно для оценки по единственному шоку.
+
+Панельная **DiD** и **CausalImpact** дают разную чувствительность, но одну содержательную картину. Суммарный коэффициент **DiD** получился незначимым (-0,72 минуты, p = 0,32), потому что усредняет резкий провал 2020 года с уже сомкнувшимся разрывом 2022-2023 годов; **CausalImpact**, который сильнее "весит" именно провал 2020-го, фиксирует эффект (p = 0,03, вероятность 97%). Обе оценки совпадают по знаку (отрицательный), а событийная динамика уточняет, что эффект сосредоточен в 2020 и затухает к 2023. Это и есть согласованность по сути: не одинаковые числа, а одна и та же траектория "от глубокий провал к возврату".
+
+Вывод по задаче 3. Две оценки разной природы - панельная **DiD** и байесовский контрфактуал - сходятся по знаку: сильно затронутый сегмент отклонился от ожидаемой надёжности вниз, причём отклонение сосредоточено в 2020 году (событийная динамика: −5,5 минут в 2020, примерно 0 минут к 2023) и для накопленного эффекта поддержано надёжно по направлению (**CausalImpact**: -35%, вероятность эффекта 97%, p = 0,03), хотя его точная величина оценена широко. Суммарный коэффициент **DiD** при этом незначим (-0,72 минуты, p = 0,32), потому что усредняет острый провал 2020 с уже сомкнувшимся разрывом 2022–2023 годов. Содержательный итог устойчив: реакция надёжности на шок - не артефакт сезонности, а реальное отклонение, по дозе воздействия пропорциональное размеру хаба, которое к 2023 году в основном отыграно по уровню (но не по структуре причин - см. задачу 2).
+
+# Задача 4. Архетипы устойчивости и их факторы
+
+## "Паспорт траектории" маршрута
+
+Для каждого маршрута (пара **origin** – **dest**) собирается профиль: эталон 2019, провал 2020 и состояние 2023. Берутся маршруты с достаточным числом рейсов в опорных годах, чтобы оценки были устойчивы.
+
+```{r route-passport}
+route_year <- dbGetQuery(con,
+  "SELECT origin, dest, year(fl_date) AS year,
+         count(*) AS n,
+         avg(arr_delay) AS mean_delay,
+         avg(CASE WHEN cancelled = 1 THEN 1.0 ELSE 0 END) AS cancel_rate,
+         sum(CASE WHEN arr_delay >= 15
+                  THEN coalesce(delay_due_carrier,0) + coalesce(delay_due_late_aircraft,0)
+                  ELSE 0 END) AS oper_min,
+         sum(CASE WHEN arr_delay >= 15
+                  THEN coalesce(delay_due_carrier,0)+coalesce(delay_due_weather,0)
+                     + coalesce(delay_due_nas,0)+coalesce(delay_due_security,0)
+                     + coalesce(delay_due_late_aircraft,0)
+                  ELSE 0 END) AS total_min
+  FROM flights
+  WHERE year(fl_date) IN (2019, 2020, 2023)
+  GROUP BY 1,2,3
+  ORDER BY 1,2,3") %>%
+  
+  as_tibble() %>%
+  
+  mutate(oper_share = if_else(total_min > 0,
+                              oper_min / total_min,
+                              NA_real_))
+
+
+route_dist <- dbGetQuery(con,
+  "SELECT origin, dest, avg(distance) AS distance FROM flights GROUP BY 1,2 ORDER BY 1,2") %>%
+  
+  as_tibble()
+
+wide <- route_year %>%
+  
+  select(origin,
+         dest,
+         year,
+         n,
+         mean_delay,
+         cancel_rate,
+         oper_share) %>%
+  
+  pivot_wider(names_from = year,
+              values_from = c(n,
+                              mean_delay,
+                              cancel_rate,
+                              oper_share),
+              names_sep = "_")
+
+
+passport <- wide %>%
+  
+  filter(n_2019 >= 100,
+         n_2020 >= 30,
+         n_2023 >= 100) %>%
+  
+  inner_join(route_dist,
+             by = c("origin",
+                    "dest")) %>%
+  
+  mutate(depth_2020 = mean_delay_2020 - mean_delay_2019,
+         gap_2023 = mean_delay_2023 - mean_delay_2019,
+         cancel_gap = cancel_rate_2023 - cancel_rate_2019,
+         cause_shift = oper_share_2023 - oper_share_2019,
+         haul_type = cut(distance,
+                         c(0,
+                           500,
+                           1500,
+                           Inf),
+                       labels = c("short",
+                                  "medium",
+                                  "long")),) %>%
+  
+  filter(if_all(c(depth_2020,
+                  gap_2023,
+                  cancel_gap,
+                  cause_shift),
+                is.finite)) %>%
+  
+  arrange(origin, dest)
+
+
+cat("Маршрутов в анализе:",
+    nrow(passport),
+    "\n")
+```
+
+После отбора по плотности (>=100 рейсов в 2019 и 2023, >=30 в провальном 2020) в анализ попадает 1467 маршрутов (пар **origin** – **dest**), наблюдаемых во всех трёх опорных годах.
+
+## FAMD и выбор числа кластеров
+
+Группировка маршрутов по форме траектории. Признаки смешанные (числовые показатели спада/восстановления плюс категориальный тип дальности), поэтому размерность снижается методом **FAMD**, а число кластеров выбирается по силуэту.
+
+```{r famd}
+clust_feats <- passport %>%
+  
+  transmute(depth_2020,
+            gap_2023,
+            cancel_gap,
+            cause_shift,
+            haul_type = factor(haul_type)) %>%
+  
+  drop_na()
+
+famd <- FAMD(as.data.frame(clust_feats),
+             ncp = 5,
+             graph = FALSE)
+
+coords <- as.data.frame(famd$ind$coord)
+
+fviz_screeplot(famd,
+               addlabels = TRUE) +
+  
+  labs(title = "FAMD: доля объяснённой инерции по осям")
+
+
+set.seed(SEED)
+
+fviz_nbclust(coords,
+             kmeans,
+             method = "silhouette",
+             k.max = 8) +
+  
+  labs(title = "Выбор числа кластеров по среднему силуэту")
+```
+
+Инерция распределена по осям довольно равномерно: первые пять компонент FAMD объясняют 24,2%/20,5%/16,8%/15,8%/14,3%  (первые две - около 45%), то есть единственной доминирующей оси нет - это типично для смешанных признаков и означает, что траектории различаются сразу по нескольким измерениям. Силуэт достигает максимума при k = 3 (среднее равно примерно 0,305). Для анализа берётся k = 4 - оптимум силуэта плюс один: сознательная жертва малой долей формального качества разбиения (силуэт опускается до примерно 0,287) ради содержательной детализации - при k = 4 "застрявшие на полпути" и "структурно ухудшившиеся" маршруты расходятся в отдельные архетипы, тогда как при k = 3 они сливаются в один. Падение силуэта при этом незначительное, так что разбиение остаётся осмысленным.
+
+## Кластеризация и устойчивость
+
+Прогонка **k-means** и **PAM**, сравнение средних силуэтов. Устойчивость разбиения проверяется дроблением выборки: маршруты разбиваются на две случайные половины и наблюдается, сохраняется ли качество разбиения.
+
+```{r clustering}
+K <- 4
+
+
+set.seed(SEED)
+
+km  <- kmeans(coords,
+              centers = K,
+              nstart = 25)
+pam_fit <- pam(coords,
+               k = K)
+
+
+sil_km  <- mean(silhouette(km$cluster,
+                           dist(coords))[, 3])
+sil_pam <- mean(silhouette(pam_fit$clustering,
+                           dist(coords))[, 3])
+
+
+set.seed(SEED)
+
+half_id <- sample(rep(c("A",
+                        "B"),
+                      length.out = nrow(coords)))
+
+stab <- map_dbl(c("A",
+                  "B"),
+                function(h) {idx <- which(half_id == h)
+                set.seed(SEED)
+                mean(silhouette(kmeans(coords[idx, ],
+                                       centers = K,
+                                       nstart = 25)$cluster,
+                                dist(coords[idx, ]))[, 3])})
+
+tibble(Метод = c("k-means (полные)",
+                 "PAM (полные)",
+                 "k-means (половина A)",
+                 "k-means (половина B)"),
+       `Средний силуэт` = round(c(sil_km,
+                                  sil_pam,
+                                  stab[1],
+                                  stab[2]),
+                                3)) %>%
+  
+  kable(caption = "Качество и устойчивость кластеризации траекторий")
+
+
+cl_key <- tibble(.km = km$cluster,
+                 gap_2023 = passport$gap_2023) %>%
+  
+  group_by(.km) %>%
+  
+  summarise(g = mean(gap_2023), .groups = "drop") %>%
+  
+  arrange(g) %>%
+  
+  mutate(cluster_id = row_number())
+
+
+passport$cluster <- factor(cl_key$cluster_id[match(km$cluster,
+                                                   cl_key$.km)],
+                           levels = seq_len(K))
+```
+
+Разбиение умеренно выраженное и устойчивое: средний силуэт k-means - 0,287, PAM - 0,256 (схоже, то есть решение не зависит от выбора алгоритма), а на двух случайных половинах маршрутов качество держится на близком уровне (около 0,27-0,29), то есть структура кластеров не разваливается при дроблении выборки. Силуэт равный примерно 0,3 - это "есть структура, но кластеры соприкасаются", что согласуется с непрерывным облаком точек на диаграмме ниже, а не с резко разделёнными группами.
+
+## Профили архетипов
+
+```{r archetypes}
+archetypes <- passport %>%
+  
+  group_by(cluster) %>%
+  
+  summarise(n_routes = n(),
+            depth_2020 = mean(depth_2020),
+            gap_2023 = mean(gap_2023),
+            cancel_gap = mean(cancel_gap),
+            cause_shift = mean(cause_shift),
+            .groups = "drop")
+
+
+kable(archetypes,
+      digits = 3,
+      caption = "Средние профили кластеров — содержательные архетипы восстановления")
+
+
+passport %>%
+  
+  ggplot(aes(depth_2020,
+             gap_2023,
+             colour = cluster)) +
+  
+  geom_point(alpha = 0.4) +
+  
+  labs(title = "Маршруты в координатах глубина провала - недовосстановление",
+       subtitle = "Кластеры = архетипы устойчивости",
+       x = "Провал 2020 (Δ задержки к 2019)",
+       y = "Разрыв 2023 (Δ задержки к 2019)",
+       colour = "Архетип") +
+  
+  theme_minimal()
+```
+
+Четыре кластера читаются как содержательные архетипы. Теперь они занумерованы по росту недовосстановления **gap_2023**: №1 - лучший возврат (минимальный разрыв к 2019), №4 - худший.
+
+1. Кластер 1 - "глубоко провалились, но восстановились" (257 маршрутов). Самый сильный провал в 2020-м (**depth_2020** = -19,9: в опустевшем 2020 эти маршруты приходили намного раньше плана), а к 2023 они лучше эталона - **gap_2023** = -5. При этом у них наибольший сдвиг структуры причин (0,112): уровень вернулся с запасом, но природа задержек всё равно сместилась к эксплуатационной.
+
+2. Кластер 2 - "слабо задело, мягкий разрыв" (439 маршрутов). Самый неглубокий провал (**depth_2020** = -7,7), умеренное недовосстановление (**gap_2023** = +4,6) и наименьший сдвиг причин (0,017).
+
+3. Кластер 3 - "структурно ухудшились" (193 маршрута). Разрыв +5,9 минут при крупном сдвиге причин (0,073) - ухудшилась не только величина, но и состав задержек.
+
+4. Кластер 4 - самый массовый, "застряли хуже всех по уровню" (578 маршрутов). Умеренный провал (-9,2), но наибольший разрыв к 2023 - **gap_2023** = +7,6 минут к эталону.
+
+Видна и общая закономерность облака: чем глубже был провал 2020 года (левее по оси X), тем чаще маршрут к 2023 оказывается лучше эталона (ниже по оси Y) - "полностью восстановившийся" кластер 1 концентрируется в нижнем левом углу.
+
+Нужно объяснить, чем определяется недовосстановление (**gap_2023**), используя только пред-определённые (не путать с предопределёнными) атрибуты маршрута: дальность, эталонную надёжность 2019, тип дальности. Признаки-исходы (глубина провала, сдвиг причин) в модель не нужно подавать - можно получить утечку и фиктивно высокое качество.
+
+```{r ml-drivers}
+ml_df <- passport %>%
+  transmute(gap_2023,
+            distance,
+            base_delay_2019 = mean_delay_2019,
+            base_cancel_2019 = cancel_rate_2019,
+            base_oper_2019 = oper_share_2019,
+            haul_short = as.integer(haul_type == "short"),
+            haul_long = as.integer(haul_type == "long")) %>%
+  
+  drop_na()
+
+
+set.seed(SEED)
+
+idx <- sample(nrow(ml_df),
+              0.8 * nrow(ml_df))
+
+X <- as.matrix(ml_df %>%
+                 
+                 select(-gap_2023))
+
+y <- ml_df$gap_2023
+
+dtrain <- xgb.DMatrix(X[idx, ],
+                      label = y[idx])
+dtest  <- xgb.DMatrix(X[-idx, ],
+                      label = y[-idx])
+
+
+set.seed(SEED)
+
+xgb_fit <- xgb.train(params = list(objective = "reg:squarederror",
+                                   max_depth = 4,
+                                   eta = 0.1,
+                                   subsample = 0.8,
+                                   colsample_bytree = 0.8),
+                     data = dtrain,
+                     nrounds = 200,
+                     watchlist = list(test = dtest),
+                     early_stopping_rounds = 20,
+                     verbose = 0)
+
+
+shp <- shapviz(xgb_fit,
+               X_pred = X[-idx, ],
+               X = ml_df[-idx, -1])
+
+sv_importance(shp,
+              kind = "beeswarm") +
+  
+  labs(title = "SHAP: что определяет недовосстановление маршрута к 2023")
+```
+
+**Beeswarm** ранжирует пред-определённые атрибуты по влиянию на **gap_2023**. С большим отрывом лидирует **base_delay_2019** - исходная (доковидная) пунктуальность маршрута. Направление вклада обратное и содержательное: у маршрутов с низкой задержкой в 2019 (тёмные точки - исходно пунктуальные) **SHAP** положителен, то есть они недовосстанавливаются сильнее; у исходно "грязных" по задержке маршрутов (жёлтые, высокая **base_delay_2019**) **SHAP** уходит в минус (вплоть до -15) - эффект регрессии к среднему: тем, кто и так опаздывал, ухудшаться почти некуда. Следом по важности идёт **distance**, затем эксплуатационная доля **base_oper_2019** и доля отмен **base_cancel_2019** (умеренный вклад); индикаторы дальности (**haul_short**, **haul_long**) влияют слабее всего. Практический смысл: риск недовосстановления можно оценивать заранее, по доковидному профилю маршрута, не дожидаясь факта 2023 года.
+
+Вывод по задаче 4. 1467 маршрутов распадаются на четыре устойчивых архетипа, занумерованных по росту недовосстановления - от "глубоко провалились, но вернулись лучше эталона" (кластер 1, 257 маршрутов, **gap_2023** = -5) через "слабо задело" (кластер 2, 439 маршрутов) и "структурно ухудшились" (кластер 3, 193 маршрута, сдвиг причин 0,073) до массового "застряли по уровню" (кластер 4, 578 маршрутов, +7,6 минут). Число кластеров взято как оптимум силуэта (k = 3) плюс один, ради содержательного разделения "застрявших" и "ухудшившихся". Кластеризация устойчива к подвыборке (силуэт равен примерно 0,28-0,29 на половинах). Главный драйвер недовосстановления по **SHAP** - доковидная пунктуальность маршрута (**base_delay_2019**), причём исходно пунктуальные маршруты недовосстанавливаются сильнее; это позволяет прогнозировать риск ещё до наблюдения исхода, по пред-определённым характеристикам, без утечки.
+
+# Задача 5. Рекомендации и панель мониторинга
+
+## Рекомендации по архетипам
+
+Превращение архетипов в управленческие решения: где возвращать ёмкости, где пересматривать обещания по пунктуальности, где закладывать риск сбоев в расписание. Правила выводятся из профилей кластеров, а не назначаются вручную.
+
+```{r recommendations}
+reco <- archetypes %>%
+  
+  mutate(`Состояние восстановления` = case_when(gap_2023 <= 0 ~ "Полностью восстановился",
+                                                gap_2023 > 0 & cause_shift <= 0.05 ~ "Частично восстановился",
+                                                TRUE ~ "Структурно ухудшился"),
+         `Рекомендация` = case_when(gap_2023 <= 0 ~ "Возвращать провозные ёмкости: спрос и надёжность есть",
+                                    gap_2023 > 0 & cause_shift <= 0.05 ~ "Точечное наращивание; мониторить пунктуальность",
+                                    TRUE ~ "Пересмотреть обещания по пунктуальности и заложить риск сбоев в расписание")) %>%
+  
+  select(Архетип = cluster,
+         `Маршрутов` = n_routes,
+         `Δ задержки 2023` = gap_2023,
+         `Сдвиг причин` = cause_shift,
+         `Состояние восстановления`,
+         `Рекомендация`)
+
+
+kable(reco,
+      digits = 3,
+      caption = "Рекомендации по архетипам восстановления")
+```
+
+Правила, выведенные из профилей кластеров, дают следующий расклад. Кластер 1 (257 маршрутов, **gap_2023** = -5 <= 0) - "полностью восстановился": сюда возвращать провозные ёмкости, спрос и надёжность есть. Кластеры 2 и 4 (439 и 578 маршрутов, разрыв +4,6 и +7,6 при сдвиге причин <= 0,05) - "частично восстановился": точечное наращивание с мониторингом пунктуальности. Кластер 3 (193 маршрута, сдвиг причин 0,073 > 0,05) - "структурно ухудшился": здесь пересматривать обещания по пунктуальности и закладывать риск сбоев в расписание. Самый массовый сегмент (кластер 4, 578 маршрутов) - именно тот, где наращивать ёмкости нужно осторожно.
+
+## Макет панели: тепловая карта недовосстановления
+
+Витрина для руководства опирается на уже посчитанные метрики. Демонстрация по крупнейшим аэропортам разрыв 2023 относительно эталона 2019 по нескольким измерениям - где система всё ещё ниже доковидной нормы.
+
+```{r dashboard}
+airport_recovery <- dbGetQuery(con,
+  "WITH a AS (
+    SELECT origin, year(fl_date) AS year,
+           avg(arr_delay) AS mean_delay,
+           avg(CASE WHEN cancelled = 1 THEN 1.0 ELSE 0 END) AS cancel_rate,
+           count(*) AS n
+    FROM flights WHERE year(fl_date) IN (2019, 2023)
+    GROUP BY 1, 2
+  )
+  SELECT origin,
+         max(CASE WHEN year=2023 THEN mean_delay  END) - max(CASE WHEN year=2019 THEN mean_delay  END) AS delay_gap,
+         max(CASE WHEN year=2023 THEN cancel_rate END) - max(CASE WHEN year=2019 THEN cancel_rate END) AS cancel_gap,
+         max(CASE WHEN year=2023 THEN n END)::DOUBLE / max(CASE WHEN year=2019 THEN n END) - 1 AS volume_change
+  FROM a GROUP BY origin
+  HAVING max(CASE WHEN year=2019 THEN n END) IS NOT NULL
+     AND max(CASE WHEN year=2023 THEN n END) IS NOT NULL") %>%
+  
+  as_tibble()
+
+dash <- airport_recovery %>%
+  
+  filter(origin %in% top_hubs) %>%
+  
+  pivot_longer(c(delay_gap,
+                 cancel_gap,
+                 volume_change),
+               names_to = "metric",
+               values_to = "value") %>%
+  
+  mutate(metric = recode(metric,
+                         delay_gap = "Разрыв задержки",
+                         cancel_gap = "Разрыв отмен",
+                         volume_change = "Изменение объёма"))
+
+
+ggplot(dash,
+       aes(metric,
+           origin,
+           fill = value)) +
+  
+  geom_tile(colour = "#f0eee9") +
+  
+  geom_text(aes(label = round(value,
+                              3)),
+            size = 3) +
+  
+  scale_fill_gradient2(low = "#265073",
+                       mid = "#f0eee9",
+                       high = "#ff746c",
+                       midpoint = 0) +
+  
+  labs(title = "Панель мониторинга восстановления (макет)",
+       subtitle = "Красное - хуже доковидной нормы 2019; синее - лучше",
+       x = NULL,
+       y = "Аэропорт",
+       fill = "Δ к 2019") +
+  
+  theme_minimal()
+```
+
+Тепловая карта по шести крупнейшим хабам сводит восстановление к трём цифрам на аэропорт. Отмены к 2023 фактически вернулись к норме 2019 везде (**cancel_gap** от -0,013 до +0,006). Задержка - обратная картина: пять хабов из шести структурно хуже 2019 года, с разрывом от +4,4 минут (**LAX**) до +7,6 минуи (**ATL** - худший), и лишь **ORD** оказался чуть лучше эталона (−1,03 минуты). Отдельно бросается в глаза объём: у всех шести мегахабов он в 2023 ниже 2019-го - от −25% (**DEN**) до -50% (**ORD**) по выборочным счётчикам. С учётом того, что суммарный месячный объём системы (задача 2) к 2023 вернулся к доковидному, это указывает на перераспределение трафика прочь от крупнейших легаси-хабов - система восстановила объём, но иначе расставила его по сети.
+
+Вывод по задаче 5. Рекомендации адресны: возвращать ёмкости - в восстановившийся кластер 1 (257 маршрутов), наращивать осторожно с мониторингом - в частично восстановившиеся кластеры 2 и 4 (1017 маршрутов суммарно), пересматривать обещания по пунктуальности и закладывать риск - в структурно ухудшившийся кластер 3 (193 маршрута). Макет панели на сквозных метриках показывает руководству главную асимметрию доковидной нормы 2019 года: отмены вернулись, а задержки на пяти из шести мегахабов структурно хуже (**ATL** +7,6 минут, **ORD** - единственное исключение), при этом объём на самих мегахабах ниже 2019 - трафик перетёк по сети. В продакшене панель естественно развернуть в **flexdashboard**/**shiny** с теми же селекторами (аэропорт, метрика, период).
+
+# Воспроизводимость
+
+```{r session, echo = FALSE}
+dbDisconnect(con,
+             shutdown = TRUE)
+
+
+sessionInfo()
+```
+
+```{r}
+
+```
